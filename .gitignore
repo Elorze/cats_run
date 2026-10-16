@@ -1,12 +1,8 @@
-node_modules/
+﻿node_modules/
 .vercel/
-tools/e2e-out/
+.env.local
+tools/_e2e_out/
+assets/game/debug_path.jpg
 *.log
 .DS_Store
 Thumbs.db
-assets/embed/pack.json
-assets/embed/assets.js
-assets/final/pack.json
-assets/final/assets.js
-.vercel
-.env*.local

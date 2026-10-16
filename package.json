@@ -1,10 +1,10 @@
 {
   "name": "cats-run",
   "private": true,
-  "version": "1.0.0",
-  "description": "Meow Drift - dopamine cat runway game for Riffle vibe coding",
+  "version": "2.0.0",
+  "description": "Meow Drift — closed-loop top-down cat drift",
   "scripts": {
-    "build": "node -e \"require('fs').copyFileSync('MeowDrift.html','index.html')\"",
-    "dev": "npx --yes serve -l 3000"
+    "build": "python tools/build_html.py",
+    "prepare-assets": "python tools/prepare.py"
   }
 }
