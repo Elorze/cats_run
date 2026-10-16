@@ -4,7 +4,6 @@
   "version": "2.0.0",
   "description": "Meow Drift — closed-loop top-down cat drift",
   "scripts": {
-    "build": "python tools/build_html.py",
-    "prepare-assets": "python tools/prepare.py"
+    "build": "node -e \"console.log('static index.html ready')\""
   }
 }
