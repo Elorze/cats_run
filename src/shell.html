@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>Meow Drift — Dopamine Cat Run</title>
+  <style>
+    :root { color-scheme: light; }
+    html, body {
+      margin: 0; padding: 0; width: 100%; height: 100%;
+      background: #1a1f1c;
+      overflow: hidden;
+      touch-action: none;
+      -webkit-user-select: none;
+      user-select: none;
+      overscroll-behavior: none;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+    }
+    #wrap {
+      position: fixed; inset: 0;
+      display: grid; place-items: center;
+      background:
+        radial-gradient(ellipse at 50% 20%, #2a4038 0%, #1a1f1c 70%);
+    }
+    canvas {
+      display: block;
+      width: min(100vw, calc(100vh * 9 / 16));
+      height: min(100vh, calc(100vw * 16 / 9));
+      max-width: 100vw; max-height: 100vh;
+      background: #b8e0d2;
+      touch-action: none;
+      box-shadow: 0 12px 48px rgba(0,0,0,.45);
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap"><canvas id="game" width="390" height="694"></canvas></div>
+  <!--ASSETS-->
+  <script>
+/*GAME*/
+  </script>
+</body>
+</html>
