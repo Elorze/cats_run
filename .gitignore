@@ -8,3 +8,5 @@ assets/embed/pack.json
 assets/embed/assets.js
 assets/final/pack.json
 assets/final/assets.js
+.vercel
+.env*.local
