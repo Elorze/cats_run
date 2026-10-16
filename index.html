@@ -378,24 +378,19 @@ window.TRACK_META={"width": 720, "height": 1291, "path": [[609.8460279355247, 58
     state.pathIdx = idx;
     state._traveled = (state._traveled || 0) + Math.max(0, delta);
 
-    // Finish: cross the finish plane forward after most of a lap.
-    // Uses a half-plane test so a messy nearest-index can't skip the trigger.
+    // Finish: progress wraps across finishIndex after most of a lap.
+    // (Half-plane tests flip elsewhere on the loop and miss the real line.)
     const fi = meta.finishIndex || 0;
-    const fp = PATH[fi] || PATH[0];
-    const ft = pathTangent(fi);
-    const side = (state.x - fp.x) * ft.x + (state.y - fp.y) * ft.y;
-    const prevSide = state._finishSide;
-    state._finishSide = side;
-    const crossedPlane =
-      prevSide != null && prevSide <= 0 && side > 0 && Math.abs(side) < TRACK_HALF * 1.8;
-    const nearStrip = distToPath(state.x, state.y) < TRACK_HALF * 1.15;
-    const nearFinishIdx = Math.min(Math.abs(cur - fi), n - Math.abs(cur - fi)) < 10;
+    const prevRel = ((prev - fi) % n + n) % n;
+    const curRel = ((cur - fi) % n + n) % n;
+    const wrappedAcrossFinish = prevRel > n - 14 && curRel < 14;
+    const nearStrip = distToPath(state.x, state.y) < TRACK_HALF * 1.25;
     if (
       !state.crossedFinish &&
-      state.time > 3.5 &&
-      state._traveled > n * 0.7 &&
+      state.time > 3.2 &&
+      state._traveled > n * 0.65 &&
       nearStrip &&
-      (crossedPlane || (nearFinishIdx && delta > 0 && side > 0 && prevSide != null && prevSide <= 4))
+      wrappedAcrossFinish
     ) {
       state.crossedFinish = true;
       onFinish();
@@ -430,9 +425,10 @@ window.TRACK_META={"width": 720, "height": 1291, "path": [[609.8460279355247, 58
   }
 
   function camScale() {
-    // show a local window of the world — not the whole loop
-    const base = Math.min(VW / 280, VH / 420);
-    return base * 1.15;
+    // Phone-like local window (~340×520 world units), capped so desktop
+    // windows don't zoom the cat into a giant portrait with no road.
+    const base = Math.min(VW / 340, VH / 520);
+    return Math.min(1.85, Math.max(0.85, base));
   }
 
   function draw() {
