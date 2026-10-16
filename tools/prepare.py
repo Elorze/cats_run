@@ -107,126 +107,119 @@ def slice_sprites() -> dict:
     return atlas
 
 
+def catmull_rom_chain(pts, n_per_seg=16):
+    pts = list(pts)
+    pts = [pts[-2], pts[-1]] + pts + [pts[0], pts[1]]
+    out = []
+    for i in range(1, len(pts) - 2):
+        p0, p1, p2, p3 = pts[i - 1], pts[i], pts[i + 1], pts[i + 2]
+        for j in range(n_per_seg):
+            t = j / n_per_seg
+            t2 = t * t
+            t3 = t2 * t
+            x = 0.5 * (
+                (2 * p1[0])
+                + (-p0[0] + p2[0]) * t
+                + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2
+                + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3
+            )
+            y = 0.5 * (
+                (2 * p1[1])
+                + (-p0[1] + p2[1]) * t
+                + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2
+                + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3
+            )
+            out.append([x, y])
+    out.append(out[0][:])
+    return out
+
+
+def resample_path(path, spacing=14.0):
+    pts = [list(p) for p in path]
+    out = [pts[0][:]]
+    carry = 0.0
+    for i in range(1, len(pts)):
+        x0, y0 = pts[i - 1]
+        x1, y1 = pts[i]
+        sdx, sdy = x1 - x0, y1 - y0
+        seg = float(np.hypot(sdx, sdy))
+        if seg < 1e-6:
+            continue
+        pos = 0.0
+        while carry + (seg - pos) >= spacing:
+            need = spacing - carry
+            t = (pos + need) / seg
+            out.append([x0 + sdx * t, y0 + sdy * t])
+            pos += need
+            carry = 0.0
+        carry += seg - pos
+    out.append(out[0][:])
+    return out
+
+
 def extract_centerline() -> dict:
-    """Sample dark track pixels and build ordered closed centerline."""
+    """Author a clean closed centerline (game coords) for the loop track.
+
+    Auto-tracing the raster art produced knots near the checkered finish and made
+    curb/finish rendering look chaotic. A stable authored path matches the
+    silhouette and keeps finish detection reliable.
+    """
     im = Image.open(RAW / "track_loop.png").convert("RGB")
-    # work at moderate res for speed
-    max_w = 360
-    scale = max_w / im.width
-    small = im.resize((max_w, int(im.height * scale)), Image.Resampling.BILINEAR)
-    a = np.asarray(small).astype(np.float32)
-    # track = dark gray (low brightness, low green dominance vs grass)
-    brightness = a.mean(axis=2)
-    green = a[:, :, 1]
-    # grass is bright green; track is dark
-    track = (brightness < 90) & (green < 110)
-    # also include slightly lighter curb-adjacent asphalt
-    track |= (brightness < 120) & (green < 130) & (a[:, :, 0] < 140)
+    tw = 720
+    th = int(im.height * (tw / im.width))
 
-    ys, xs = np.where(track)
-    if len(xs) < 100:
-        raise RuntimeError("track mask too small")
+    # Key points in game coordinates — finish on the right straight, then up and around.
+    waypoints = [
+        [610, 580],
+        [612, 520],
+        [610, 450],
+        [600, 380],
+        [575, 320],
+        [530, 270],
+        [460, 245],
+        [380, 250],
+        [310, 280],
+        [260, 340],
+        [250, 420],
+        [270, 490],
+        [330, 540],
+        [390, 580],
+        [420, 640],
+        [390, 700],
+        [330, 750],
+        [270, 810],
+        [250, 890],
+        [290, 960],
+        [370, 1010],
+        [460, 1030],
+        [540, 1000],
+        [590, 940],
+        [610, 860],
+        [615, 780],
+        [615, 700],
+        [612, 640],
+        [610, 600],
+    ]
+    path = resample_path(catmull_rom_chain(waypoints, 16), 14)
 
-    # distance transform style skeleton approx via local maxima of distance to grass
-    # simpler: bin into cells and take centroid of track pixels per cell along a loop order
-    # Use angular sort around track centroid after thinning via stride
-    cy, cx = ys.mean(), xs.mean()
-
-    # Collect sample points by walking with nearest-neighbor along mask
-    mask = track
-    # pick start: rightmost track pixel near vertical middle of right straight (finish area)
-    right_candidates = np.where(mask[:, -40:])
-    if len(right_candidates[0]):
-        ry = right_candidates[0]
-        rx = right_candidates[1] + (mask.shape[1] - 40)
-        # prefer mid-right
-        mid = mask.shape[0] / 2
-        i = int(np.argmin(np.abs(ry - mid)))
-        start = (int(rx[i]), int(ry[i]))
-    else:
-        start = (int(xs[np.argmax(xs)]), int(ys[np.argmax(xs)]))
-
-    # greedy walk
-    pts = [start]
-    visited = np.zeros_like(mask, dtype=bool)
-    x, y = start
-    step = 6
-    for _ in range(800):
-        visited[
-            max(0, y - step) : min(mask.shape[0], y + step + 1),
-            max(0, x - step) : min(mask.shape[1], x + step + 1),
-        ] = True
-        # search ring ahead
-        best = None
-        best_score = -1e9
-        for ang in np.linspace(0, 2 * np.pi, 36, endpoint=False):
-            nx = int(round(x + step * np.cos(ang)))
-            ny = int(round(y + step * np.sin(ang)))
-            if not (0 <= nx < mask.shape[1] and 0 <= ny < mask.shape[0]):
-                continue
-            if not mask[ny, nx]:
-                continue
-            # prefer unvisited
-            vpen = 80 if visited[ny, nx] else 0
-            # prefer continuing direction
-            if len(pts) >= 2:
-                px, py = pts[-1][0] - pts[-2][0], pts[-1][1] - pts[-2][1]
-                dx, dy = nx - x, ny - y
-                dot = (px * dx + py * dy) / (np.hypot(px, py) * np.hypot(dx, dy) + 1e-6)
-            else:
-                dot = 0
-            score = dot * 40 - vpen
-            if score > best_score:
-                best_score = score
-                best = (nx, ny)
-        if best is None:
-            break
-        # closed?
-        if len(pts) > 40 and np.hypot(best[0] - start[0], best[1] - start[1]) < step * 1.5:
-            pts.append(start)
-            break
-        pts.append(best)
-        x, y = best
-
-    # upsample to original image coords
-    path = [[p[0] / scale, p[1] / scale] for p in pts]
-    # smooth
-    path = smooth_path(path, 2)
+    # Rotate so finish (~610,580) is index 0 and direction goes up (decreasing y).
+    tx, ty = 610.0, 580.0
+    bi = int(np.argmin([(p[0] - tx) ** 2 + (p[1] - ty) ** 2 for p in path[:-1]]))
+    path = path[bi:-1] + path[:bi] + [path[bi][:]]
+    if path[4][1] > path[0][1]:
+        path = path[::-1]
+    path[-1] = path[0][:]
 
     meta = {
-        "width": im.width,
-        "height": im.height,
+        "width": tw,
+        "height": th,
         "path": path,
-        "startIndex": 0,
+        "finishIndex": 0,
+        "startIndex": 5,
     }
-    # find finish: checkered is black/white on right straight — use rightmost dense area mid
-    meta["finishIndex"] = find_finish_index(path, im.width)
     (OUT / "track_meta.json").write_text(json.dumps(meta), encoding="utf-8")
-    print(f"centerline points: {len(path)} finishIndex={meta['finishIndex']}")
+    print(f"centerline points: {len(path)} finishIndex=0 startIndex=5")
     return meta
-
-
-def smooth_path(path, passes=2):
-    pts = path[:]
-    for _ in range(passes):
-        nxt = [pts[0]]
-        for i in range(1, len(pts) - 1):
-            x = (pts[i - 1][0] + pts[i][0] * 2 + pts[i + 1][0]) / 4
-            y = (pts[i - 1][1] + pts[i][1] * 2 + pts[i + 1][1]) / 4
-            nxt.append([x, y])
-        nxt.append(pts[-1])
-        pts = nxt
-    return pts
-
-
-def find_finish_index(path, width):
-    # finish line roughly mid-right straight: high x, medium y
-    best_i, best = 0, -1e9
-    for i, (x, y) in enumerate(path[:-1]):
-        score = x - abs(y - path[len(path) // 2][1]) * 0.15
-        if x > width * 0.7 and score > best:
-            best, best_i = score, i
-    return best_i
 
 
 def pack_assets(meta: dict) -> None:
@@ -235,7 +228,7 @@ def pack_assets(meta: dict) -> None:
     tw = 720
     th = int(track.height * (tw / track.width))
     track = track.resize((tw, th), Image.Resampling.LANCZOS)
-    # scale path to resized track
+    # Path may already be authored in game coords (720 x th).
     sx = tw / meta["width"]
     sy = th / meta["height"]
     path = [[x * sx, y * sy] for x, y in meta["path"]]

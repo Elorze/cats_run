@@ -234,6 +234,7 @@
     state._vx = 0;
     state._vy = 0;
     state._traveled = 0;
+    state._finishSide = null;
   }
 
   function startRace() {
@@ -247,8 +248,11 @@
 
   function onFinish() {
     state.phase = "done";
+    state.speed = 0;
+    state._vx = 0;
+    state._vy = 0;
     state.message = "冲线！";
-    state.messageT = 3;
+    state.messageT = 3.5;
     if (!state.best || state.time < state.best) {
       state.best = state.time;
       localStorage.setItem("meowdrift_best", String(state.best));
@@ -264,11 +268,17 @@
     if (state.shake > 0) state.shake -= dt;
 
     if (state.phase === "countdown") {
+      const prevStage = state.countdown > 2.1 ? 0 : state.countdown > 1.05 ? 1 : 2;
       state.countdown -= dt;
       if (state.countdown <= 0) {
         state.phase = "race";
         state.speed = 210;
-        beep(880, 0.15, "square", 0.1);
+        beep(880, 0.15, "square", 0.12);
+        return;
+      }
+      const stage = state.countdown > 2.1 ? 0 : state.countdown > 1.05 ? 1 : 2;
+      if (stage !== prevStage) {
+        beep(stage === 2 ? 660 : 440, 0.09, "triangle", 0.11);
       }
       return;
     }
@@ -314,29 +324,36 @@
     for (const t of state.trails) t.life -= dt;
     state.trails = state.trails.filter((t) => t.life > 0).slice(-80);
 
-    // progress
+    // progress along centerline
     const idx = nearestPathIndex(state.x, state.y);
     const prev = state.lapProgress;
     const cur = progressOf(idx);
     const n = PATH.length - 1;
-    // detect wrap across finish
     let delta = cur - prev;
     if (delta < -n * 0.5) delta += n;
     if (delta > n * 0.5) delta -= n;
     state.lapProgress = cur;
     state.pathIdx = idx;
+    state._traveled = (state._traveled || 0) + Math.max(0, delta);
 
-    // Finish: must travel most of the loop, then cross finish index forward
+    // Finish: cross the finish plane forward after most of a lap.
+    // Uses a half-plane test so a messy nearest-index can't skip the trigger.
     const fi = meta.finishIndex || 0;
-    const traveled = state._traveled || 0;
-    state._traveled = traveled + Math.max(0, delta);
-    const nearFinish = Math.min(Math.abs(cur - fi), n - Math.abs(cur - fi)) < 6;
+    const fp = PATH[fi] || PATH[0];
+    const ft = pathTangent(fi);
+    const side = (state.x - fp.x) * ft.x + (state.y - fp.y) * ft.y;
+    const prevSide = state._finishSide;
+    state._finishSide = side;
+    const crossedPlane =
+      prevSide != null && prevSide <= 0 && side > 0 && Math.abs(side) < TRACK_HALF * 1.8;
+    const nearStrip = distToPath(state.x, state.y) < TRACK_HALF * 1.15;
+    const nearFinishIdx = Math.min(Math.abs(cur - fi), n - Math.abs(cur - fi)) < 10;
     if (
       !state.crossedFinish &&
-      nearFinish &&
-      delta > 0 &&
-      state.time > 4 &&
-      state._traveled > n * 0.75
+      state.time > 3.5 &&
+      state._traveled > n * 0.7 &&
+      nearStrip &&
+      (crossedPlane || (nearFinishIdx && delta > 0 && side > 0 && prevSide != null && prevSide <= 4))
     ) {
       state.crossedFinish = true;
       onFinish();
@@ -463,22 +480,25 @@
   }
 
   function drawCurbs() {
+    // Clean outer rumble strips only on stronger bends — no scattered blocks.
     const n = PATH.length - 1;
-    for (let i = 0; i < n; i += 4) {
+    if (n < 8) return;
+    for (let i = 0; i < n; i += 3) {
       const t = pathTangent(i);
-      const t2 = pathTangent((i + 3) % n);
+      const t2 = pathTangent((i + 5) % n);
       const cross = t.x * t2.y - t.y * t2.x;
-      if (Math.abs(cross) < 0.18) continue;
+      if (Math.abs(cross) < 0.22) continue;
       const p = PATH[i];
       const side = cross > 0 ? 1 : -1;
       const nx = -t.y * side;
       const ny = t.x * side;
+      const ang = Math.atan2(t.y, t.x);
       ctx.save();
-      ctx.translate(p.x + nx * (TRACK_HALF + 2), p.y + ny * (TRACK_HALF + 2));
-      ctx.rotate(Math.atan2(t.y, t.x));
-      for (let k = 0; k < 3; k++) {
-        ctx.fillStyle = k % 2 ? "#e23b3b" : "#fff";
-        ctx.fillRect(-7 + k * 5, -5, 5, 10);
+      ctx.translate(p.x + nx * (TRACK_HALF - 1), p.y + ny * (TRACK_HALF - 1));
+      ctx.rotate(ang);
+      for (let k = 0; k < 4; k++) {
+        ctx.fillStyle = k % 2 ? "#e23b3b" : "#f7f7f7";
+        ctx.fillRect(-10 + k * 6, -4.5, 6, 9);
       }
       ctx.restore();
     }
@@ -491,14 +511,32 @@
     const p = PATH[i];
     const t = pathTangent(i);
     const ang = Math.atan2(t.y, t.x);
+    const nx = -t.y;
+    const ny = t.x;
+
+    // Side barriers (red/white), like the reference — not a spray of curb crumbs.
+    for (const side of [-1, 1]) {
+      ctx.save();
+      ctx.translate(p.x + nx * side * (TRACK_HALF + 10), p.y + ny * side * (TRACK_HALF + 10));
+      ctx.rotate(ang);
+      for (let k = 0; k < 5; k++) {
+        ctx.fillStyle = k % 2 ? "#e23b3b" : "#fff";
+        ctx.fillRect(-14 + k * 7, -7, 7, 14);
+      }
+      ctx.restore();
+    }
+
+    // One clean black/white checkered strip across the asphalt.
     ctx.save();
     ctx.translate(p.x, p.y);
     ctx.rotate(ang + Math.PI / 2);
-    const cells = 10;
+    const cells = 8;
     const cw = (TRACK_HALF * 2) / cells;
-    for (let k = 0; k < cells; k++) {
-      ctx.fillStyle = k % 2 ? "#111" : "#fff";
-      ctx.fillRect(-TRACK_HALF + k * cw, -7, cw + 0.5, 14);
+    for (let row = 0; row < 2; row++) {
+      for (let k = 0; k < cells; k++) {
+        ctx.fillStyle = (k + row) % 2 ? "#111" : "#f5f5f5";
+        ctx.fillRect(-TRACK_HALF + k * cw, -8 + row * 8, cw + 0.4, 8.2);
+      }
     }
     ctx.restore();
   }
@@ -558,26 +596,121 @@
     }
   }
 
-  function drawCat() {
-    const im = img.cat;
-    const w = 46;
-    const h = im ? (im.height / im.width) * w : 70;
-    ctx.save();
-    ctx.translate(state.x, state.y);
-    // sprite faces up (-Y); angle 0 = +X, so rotate angle + PI/2
-    ctx.rotate(state.angle + Math.PI / 2);
-    // soft shadow
+  function drawVectorCat(scale) {
+    const s = scale || 1;
+    // Soft shadow
     ctx.fillStyle = "rgba(40,60,40,0.22)";
     ctx.beginPath();
-    ctx.ellipse(0, 6, 16, 8, 0, 0, Math.PI * 2);
+    ctx.ellipse(0, 7 * s, 15 * s, 7 * s, 0, 0, Math.PI * 2);
     ctx.fill();
-    if (im) ctx.drawImage(im, -w / 2, -h / 2, w, h);
-    else {
-      ctx.fillStyle = "#f4a261";
+
+    const stroke = "#5a3418";
+    const fur = "#f0a14a";
+    const furDark = "#d97d2e";
+    const belly = "#ffe0b0";
+
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+
+    // Tail
+    ctx.strokeStyle = stroke;
+    ctx.fillStyle = fur;
+    ctx.lineWidth = 2.2 * s;
+    ctx.beginPath();
+    ctx.moveTo(0, 16 * s);
+    ctx.quadraticCurveTo(14 * s, 28 * s, 6 * s, 40 * s);
+    ctx.quadraticCurveTo(-2 * s, 34 * s, -2 * s, 18 * s);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.strokeStyle = furDark;
+    ctx.lineWidth = 2 * s;
+    for (let i = 0; i < 3; i++) {
+      const ty = 22 * s + i * 6 * s;
       ctx.beginPath();
-      ctx.ellipse(0, 0, 16, 22, 0, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.moveTo(2 * s, ty);
+      ctx.lineTo(8 * s, ty + 3 * s);
+      ctx.stroke();
     }
+
+    // Body
+    ctx.fillStyle = fur;
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 2.4 * s;
+    ctx.beginPath();
+    ctx.ellipse(0, 4 * s, 16 * s, 20 * s, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Belly patch
+    ctx.fillStyle = belly;
+    ctx.beginPath();
+    ctx.ellipse(0, 8 * s, 8 * s, 11 * s, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Back stripes
+    ctx.strokeStyle = furDark;
+    ctx.lineWidth = 2.6 * s;
+    for (let i = 0; i < 3; i++) {
+      const yy = -2 * s + i * 7 * s;
+      ctx.beginPath();
+      ctx.moveTo(-10 * s, yy);
+      ctx.quadraticCurveTo(0, yy - 2 * s, 10 * s, yy);
+      ctx.stroke();
+    }
+
+    // Head
+    ctx.fillStyle = fur;
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 2.4 * s;
+    ctx.beginPath();
+    ctx.ellipse(0, -18 * s, 13 * s, 12 * s, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Ears
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(side * 6 * s, -26 * s);
+      ctx.lineTo(side * 12 * s, -36 * s);
+      ctx.lineTo(side * 2 * s, -28 * s);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#ffb6c8";
+      ctx.beginPath();
+      ctx.moveTo(side * 6.5 * s, -27 * s);
+      ctx.lineTo(side * 10 * s, -33 * s);
+      ctx.lineTo(side * 4 * s, -28 * s);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = fur;
+    }
+
+    // Closed eyes + nose (top-down cute face peeking forward)
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 1.8 * s;
+    ctx.beginPath();
+    ctx.arc(-4.5 * s, -20 * s, 2.2 * s, 0.15, Math.PI - 0.15);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(4.5 * s, -20 * s, 2.2 * s, 0.15, Math.PI - 0.15);
+    ctx.stroke();
+    ctx.fillStyle = "#ff8fab";
+    ctx.beginPath();
+    ctx.moveTo(0, -16.5 * s);
+    ctx.lineTo(-2.2 * s, -14.5 * s);
+    ctx.lineTo(2.2 * s, -14.5 * s);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawCat() {
+    ctx.save();
+    ctx.translate(state.x, state.y);
+    // Facing up in local space; world angle 0 = +X
+    ctx.rotate(state.angle + Math.PI / 2);
+    drawVectorCat(1);
     ctx.restore();
   }
 
@@ -835,40 +968,56 @@
     ctx.save();
     ctx.translate(catP.x, catP.y);
     ctx.rotate(catA + Math.PI / 2);
-    const im = img.cat;
-    const w = 54;
-    const h = im ? (im.height / im.width) * w : 74;
-    ctx.fillStyle = "rgba(40,60,40,0.18)";
-    ctx.beginPath();
-    ctx.ellipse(0, 8, 16, 8, 0, 0, Math.PI * 2);
-    ctx.fill();
-    if (im) ctx.drawImage(im, -w / 2, -h / 2, w, h);
+    drawVectorCat(1.15);
     ctx.restore();
 
     drawGear(36, 36);
     drawTrophy(VW - 36, 38);
 
-    const logoW = Math.min(VW * 0.84, 340);
-    drawSprite("ui_meow", VW / 2, 18, logoW);
-    const logoH = img.ui_meow ? logoW * (img.ui_meow.height / img.ui_meow.width) : 120;
+    drawBrandLogo(VW / 2, 28);
     const subW = Math.min(VW * 0.86, 340);
-    const subY = 18 + logoH + 6;
-    if (img.ui_tap) {
-      const subH = subW * (img.ui_tap.height / img.ui_tap.width);
-      ctx.fillStyle = "#6a3d28";
-      ctx.beginPath();
-      ctx.roundRect(VW / 2 - subW / 2 - 8, subY - 6, subW + 16, subH + 12, 16);
-      ctx.fill();
-      drawSprite("ui_tap", VW / 2, subY, subW);
-    }
+    const subY = 132;
+    ctx.fillStyle = "#6a3d28";
+    ctx.beginPath();
+    ctx.roundRect(VW / 2 - subW / 2 - 8, subY - 4, subW + 16, 44, 16);
+    ctx.fill();
+    ctx.fillStyle = "#fff6e8";
+    ctx.font = '800 15px "Trebuchet MS", sans-serif';
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("闭环赛道 · 左右漂移冲线", VW / 2, subY + 18);
 
     const btnY = VH * 0.73;
     drawStartButton(VW / 2, btnY);
-    drawSprite("ui_drift", VW / 2, btnY + 58, Math.min(VW * 0.5, 190));
+    ctx.fillStyle = "#6a3d28";
+    ctx.font = '800 14px "Trebuchet MS", sans-serif';
+    ctx.fillText("按住猫爪左右漂移", VW / 2, btnY + 62);
 
     const pawY = VH - 58;
     drawPaw("paw_l", 52, pawY, 72, 1);
     drawPaw("paw_r", VW - 52, pawY, 72, 1);
+  }
+
+  function drawBrandLogo(x, y) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.lineJoin = "round";
+    ctx.font = `900 ${Math.min(54, VW * 0.13)}px "Trebuchet MS", "Arial Rounded MT Bold", sans-serif`;
+    ctx.strokeStyle = "#5a3418";
+    ctx.lineWidth = 10;
+    ctx.strokeText("MEOW", 0, 0);
+    const grad = ctx.createLinearGradient(0, 0, 0, 50);
+    grad.addColorStop(0, "#ffb347");
+    grad.addColorStop(1, "#ff6eb4");
+    ctx.fillStyle = grad;
+    ctx.fillText("MEOW", 0, 0);
+    ctx.font = `900 ${Math.min(42, VW * 0.1)}px "Trebuchet MS", "Arial Rounded MT Bold", sans-serif`;
+    ctx.strokeText("DRIFT", 0, 52);
+    ctx.fillStyle = "#ffe066";
+    ctx.fillText("DRIFT", 0, 52);
+    ctx.restore();
   }
 
   function drawSprite(key, x, y, w) {
@@ -894,6 +1043,97 @@
     ctx.textBaseline = "alphabetic";
   }
 
+  function drawStartLights(countdown) {
+    // Traffic-light style READY / SET / GO — drawn in code, no cutout sprites.
+    const stage = countdown > 2.1 ? 0 : countdown > 1.05 ? 1 : 2;
+    const labels = ["READY", "SET", "GO!"];
+    const colors = ["#e23b3b", "#f0c040", "#3ddc84"];
+    const cx = VW / 2;
+    const cy = VH * 0.32;
+    const r = Math.min(22, VW * 0.055);
+
+    // housings
+    for (let i = 0; i < 3; i++) {
+      const x = cx + (i - 1) * (r * 2.8);
+      ctx.fillStyle = "#2a2d32";
+      ctx.beginPath();
+      ctx.roundRect(x - r - 6, cy - r - 6, (r + 6) * 2, (r + 6) * 2, 12);
+      ctx.fill();
+      ctx.fillStyle = i === stage ? colors[i] : "#4a4e55";
+      ctx.beginPath();
+      ctx.arc(x, cy, r, 0, Math.PI * 2);
+      ctx.fill();
+      if (i === stage) {
+        ctx.fillStyle = "rgba(255,255,255,0.35)";
+        ctx.beginPath();
+        ctx.ellipse(x - r * 0.25, cy - r * 0.3, r * 0.45, r * 0.28, -0.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    const pulse = 1 + Math.sin(performance.now() / 140) * 0.04;
+    ctx.save();
+    ctx.translate(cx, cy + r * 3.2);
+    ctx.scale(pulse, pulse);
+    ctx.font = `900 ${Math.min(64, VW * 0.16)}px "Trebuchet MS", "Arial Rounded MT Bold", sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = "#3b241c";
+    ctx.lineWidth = 8;
+    ctx.fillStyle = colors[stage];
+    ctx.strokeText(labels[stage], 0, 0);
+    ctx.fillText(labels[stage], 0, 0);
+    ctx.restore();
+  }
+
+  function drawFinishBanner() {
+    const cx = VW / 2;
+    const cy = VH * 0.36;
+    ctx.fillStyle = "rgba(30, 24, 20, 0.55)";
+    ctx.fillRect(0, 0, VW, VH);
+
+    ctx.fillStyle = "#fff6e8";
+    ctx.strokeStyle = "#6a3d28";
+    ctx.lineWidth = 5;
+    const bw = Math.min(VW * 0.86, 340);
+    const bh = 150;
+    ctx.beginPath();
+    ctx.roundRect(cx - bw / 2, cy - bh / 2, bw, bh, 22);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = "#6a3d28";
+    ctx.font = '900 28px "Trebuchet MS", "Arial Rounded MT Bold", sans-serif';
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("冲线成功！", cx, cy - 36);
+    ctx.font = '900 40px "Trebuchet MS", "Arial Rounded MT Bold", sans-serif';
+    ctx.fillStyle = "#ff6eb4";
+    ctx.fillText(fmtTime(state.time), cx, cy + 8);
+    ctx.font = '700 16px "Trebuchet MS", sans-serif';
+    ctx.fillStyle = "#8a5a40";
+    const best = state.best ? `最佳 ${fmtTime(state.best)}` : "新纪录！";
+    ctx.fillText(best, cx, cy + 48);
+
+    // Again hint
+    const pulse = 1 + Math.sin(performance.now() / 260) * 0.03;
+    ctx.save();
+    ctx.translate(cx, VH * 0.62);
+    ctx.scale(pulse, pulse);
+    ctx.fillStyle = "#ff7eb5";
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.roundRect(-90, -22, 180, 44, 22);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#fff";
+    ctx.font = '900 18px "Trebuchet MS", sans-serif';
+    ctx.fillText("再来一局", 0, 2);
+    ctx.restore();
+  }
+
   function drawUI() {
     const top = 18;
 
@@ -908,14 +1148,11 @@
     }
 
     if (state.phase === "countdown") {
-      const n = Math.ceil(state.countdown);
-      const key = n >= 3 ? "ui_ready" : n === 2 ? "ui_set" : "ui_go";
-      drawSprite(key, VW / 2, VH * 0.34, Math.min(VW * 0.72, 280));
+      drawStartLights(state.countdown);
     }
 
     if (state.phase === "done") {
-      drawSprite("ui_win", VW / 2, VH * 0.28, Math.min(VW * 0.7, 260));
-      drawSprite("ui_again", VW / 2, VH * 0.58, Math.min(VW * 0.62, 240));
+      drawFinishBanner();
     }
 
     // paw buttons
@@ -927,16 +1164,48 @@
   }
 
   function drawPaw(key, x, y, size, alpha) {
-    const im = img[key];
+    const label = key === "paw_l" ? "L" : "R";
+    ctx.save();
     ctx.globalAlpha = alpha;
-    if (im) ctx.drawImage(im, x - size / 2, y - size / 2, size, size);
-    else {
-      ctx.fillStyle = "#ffb4d9";
+    ctx.translate(x, y);
+    const s = size / 72;
+    // soft ground shadow
+    ctx.fillStyle = "rgba(40,60,40,0.16)";
+    ctx.beginPath();
+    ctx.ellipse(0, 6 * s, 28 * s, 12 * s, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#ff8fbf";
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 4 * s;
+    // toe beans
+    const toes = [
+      [-18, -16],
+      [-6, -22],
+      [6, -22],
+      [18, -16],
+    ];
+    for (const [tx, ty] of toes) {
       ctx.beginPath();
-      ctx.arc(x, y, size / 2, 0, Math.PI * 2);
+      ctx.ellipse(tx * s, ty * s, 9 * s, 11 * s, 0, 0, Math.PI * 2);
       ctx.fill();
+      ctx.stroke();
     }
-    ctx.globalAlpha = 1;
+    // pad
+    ctx.beginPath();
+    ctx.ellipse(0, 6 * s, 20 * s, 17 * s, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = "#fff";
+    ctx.strokeStyle = "#8a3d62";
+    ctx.lineWidth = 3 * s;
+    ctx.font = `900 ${22 * s}px "Trebuchet MS", "Arial Rounded MT Bold", sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.strokeText(label, 0, 7 * s);
+    ctx.fillText(label, 0, 7 * s);
+    ctx.restore();
   }
 
   // ---- Boot ----
