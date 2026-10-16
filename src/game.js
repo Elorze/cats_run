@@ -17,54 +17,72 @@
   const TRACK_HALF = 50;
 
   // ---- Audio (procedural Web Audio — no external files) ----
+  // Default MUTED. Sound starts only after the user taps the speaker button.
   let actx = null;
   let master = null;
   let musicBus = null;
   let sfxBus = null;
-  let soundOn = localStorage.getItem("meowdrift_sound") !== "0";
+  let soundOn = localStorage.getItem("meowdrift_sound") === "1";
   let bgmPlaying = false;
+  let bgmStepIndex = 0;
   let bgmNextT = 0;
   let engineOsc = null;
   let engineFilter = null;
   let engineGain = null;
   let roadNoise = null;
   let roadGain = null;
+  let audioReady = false;
 
   function ensureAudio() {
     if (!actx) {
       const AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) return;
+      if (!AC) return Promise.resolve(false);
       actx = new AC();
       master = actx.createGain();
-      master.gain.value = soundOn ? 0.24 : 0.0001;
+      master.gain.value = 0.0001;
       master.connect(actx.destination);
       musicBus = actx.createGain();
-      musicBus.gain.value = 0.32;
+      musicBus.gain.value = 0.85;
       musicBus.connect(master);
       sfxBus = actx.createGain();
-      sfxBus.gain.value = 0.7;
+      sfxBus.gain.value = 1;
       sfxBus.connect(master);
       setupEngineNodes();
     }
-    if (actx.state === "suspended") actx.resume();
-    applyMute();
+    const resume =
+      actx.state === "suspended" ? actx.resume().catch(() => {}) : Promise.resolve();
+    return resume.then(() => {
+      audioReady = actx.state === "running" || actx.state === "suspended";
+      applyMute(true);
+      return true;
+    });
   }
 
-  function applyMute() {
+  function applyMute(instant) {
     if (!actx || !master) return;
     const t = actx.currentTime;
+    const vol = soundOn ? 0.55 : 0.0001;
     master.gain.cancelScheduledValues(t);
-    master.gain.setTargetAtTime(soundOn ? 0.24 : 0.0001, t, 0.03);
-    if (soundOn) startBgm();
+    if (instant) master.gain.setValueAtTime(vol, t);
+    else master.gain.setTargetAtTime(vol, t, 0.04);
+    if (soundOn) startBgm(true);
     else stopBgm();
   }
 
   function toggleSound() {
     soundOn = !soundOn;
     localStorage.setItem("meowdrift_sound", soundOn ? "1" : "0");
-    ensureAudio();
-    applyMute();
-    if (soundOn) beep(660, 0.07, "sine", 0.08);
+    ensureAudio().then(() => {
+      applyMute(true);
+      if (soundOn) {
+        startBgm(true);
+        // audible click so user knows sound unlocked
+        beep(784, 0.1, "sine", 0.22);
+        setTimeout(() => beep(988, 0.12, "triangle", 0.18), 90);
+      } else {
+        updateDriveAudio(false, 0);
+      }
+    });
   }
 
   function beep(freq, dur, type, vol) {
@@ -74,13 +92,14 @@
     const g = actx.createGain();
     o.type = type || "sine";
     o.frequency.value = freq;
+    const peak = vol || 0.2;
     g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(vol || 0.15, t + 0.01);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    g.gain.exponentialRampToValueAtTime(peak, t + 0.015);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + Math.max(0.04, dur));
     o.connect(g);
     g.connect(sfxBus);
     o.start(t);
-    o.stop(t + dur + 0.02);
+    o.stop(t + dur + 0.03);
   }
 
   function noiseBuffer(seconds) {
@@ -94,55 +113,57 @@
   function sfxHit() {
     if (!actx || !sfxBus || !soundOn) return;
     const t = actx.currentTime;
-    // low thump
     const o = actx.createOscillator();
     const g = actx.createGain();
-    o.type = "triangle";
-    o.frequency.setValueAtTime(140, t);
-    o.frequency.exponentialRampToValueAtTime(48, t + 0.18);
+    o.type = "square";
+    o.frequency.setValueAtTime(180, t);
+    o.frequency.exponentialRampToValueAtTime(55, t + 0.16);
     g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(0.28, t + 0.01);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+    g.gain.exponentialRampToValueAtTime(0.35, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
     o.connect(g);
     g.connect(sfxBus);
     o.start(t);
-    o.stop(t + 0.24);
-    // noise slap
+    o.stop(t + 0.22);
+
     const src = actx.createBufferSource();
-    src.buffer = noiseBuffer(0.15);
+    src.buffer = noiseBuffer(0.18);
     const f = actx.createBiquadFilter();
-    f.type = "bandpass";
-    f.frequency.value = 900;
-    f.Q.value = 0.7;
+    f.type = "lowpass";
+    f.frequency.value = 1200;
     const ng = actx.createGain();
     ng.gain.setValueAtTime(0.0001, t);
-    ng.gain.exponentialRampToValueAtTime(0.18, t + 0.005);
-    ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+    ng.gain.exponentialRampToValueAtTime(0.28, t + 0.005);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.15);
     src.connect(f);
     f.connect(ng);
     ng.connect(sfxBus);
     src.start(t);
-    src.stop(t + 0.15);
+    src.stop(t + 0.18);
   }
 
   function sfxFinish() {
-    beep(523, 0.1, "sine", 0.14);
-    setTimeout(() => beep(659, 0.1, "sine", 0.14), 80);
-    setTimeout(() => beep(784, 0.18, "triangle", 0.16), 160);
+    if (!soundOn) return;
+    beep(523, 0.12, "sine", 0.22);
+    setTimeout(() => beep(659, 0.12, "sine", 0.22), 90);
+    setTimeout(() => beep(784, 0.2, "triangle", 0.24), 180);
   }
 
-  // Cute looping chiptune BGM (C major-ish arpeggio)
+  // Looping chiptune BGM — keeps scheduling while soundOn
   const BGM_NOTES = [
     523.25, 659.25, 783.99, 1046.5, 783.99, 659.25, 587.33, 659.25,
     392.0, 523.25, 659.25, 783.99, 659.25, 523.25, 440.0, 523.25,
   ];
-  const BGM_STEP = 0.22;
+  const BGM_STEP = 0.2;
 
-  function startBgm() {
+  function startBgm(forceRestart) {
     if (!actx || !musicBus || !soundOn) return;
-    if (!bgmPlaying) {
+    if (forceRestart || !bgmPlaying) {
       bgmPlaying = true;
-      bgmNextT = actx.currentTime + 0.05;
+      bgmStepIndex = 0;
+      bgmNextT = actx.currentTime + 0.04;
+    } else {
+      bgmPlaying = true;
     }
   }
 
@@ -152,36 +173,40 @@
 
   function pumpBgm() {
     if (!actx || !musicBus || !bgmPlaying || !soundOn) return;
+    if (actx.state !== "running") return;
     const now = actx.currentTime;
-    while (bgmNextT < now + 0.8) {
-      const i = Math.floor((bgmNextT * 1000) / (BGM_STEP * 1000)) % BGM_NOTES.length;
-      const freq = BGM_NOTES[i];
+    // avoid scheduling storms after tab sleep
+    if (bgmNextT < now - 0.05) bgmNextT = now + 0.01;
+    let guard = 0;
+    while (bgmNextT < now + 0.9 && guard++ < 24) {
+      const freq = BGM_NOTES[bgmStepIndex % BGM_NOTES.length];
       const t0 = bgmNextT;
       const o = actx.createOscillator();
       const g = actx.createGain();
-      o.type = i % 8 < 4 ? "triangle" : "sine";
+      o.type = bgmStepIndex % 8 < 4 ? "triangle" : "square";
       o.frequency.value = freq;
       g.gain.setValueAtTime(0.0001, t0);
-      g.gain.exponentialRampToValueAtTime(0.09, t0 + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.0001, t0 + BGM_STEP * 0.9);
+      g.gain.exponentialRampToValueAtTime(0.22, t0 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + BGM_STEP * 0.85);
       o.connect(g);
       g.connect(musicBus);
       o.start(t0);
       o.stop(t0 + BGM_STEP);
-      // soft bass every 4 steps
-      if (i % 4 === 0) {
+
+      if (bgmStepIndex % 4 === 0) {
         const b = actx.createOscillator();
         const bg = actx.createGain();
         b.type = "sine";
         b.frequency.value = freq / 2;
         bg.gain.setValueAtTime(0.0001, t0);
-        bg.gain.exponentialRampToValueAtTime(0.06, t0 + 0.02);
-        bg.gain.exponentialRampToValueAtTime(0.0001, t0 + BGM_STEP * 1.6);
+        bg.gain.exponentialRampToValueAtTime(0.16, t0 + 0.02);
+        bg.gain.exponentialRampToValueAtTime(0.0001, t0 + BGM_STEP * 1.5);
         b.connect(bg);
         bg.connect(musicBus);
         b.start(t0);
-        b.stop(t0 + BGM_STEP * 1.7);
+        b.stop(t0 + BGM_STEP * 1.6);
       }
+      bgmStepIndex++;
       bgmNextT += BGM_STEP;
     }
   }
@@ -222,14 +247,11 @@
     const racing = state.phase === "race";
     const want = racing && soundOn;
     const spd = Math.max(0, speed);
-    // engine pitch/level rises with speed; louder on asphalt
-    const targetEng = want ? (onRoad ? 0.045 + spd * 0.00012 : 0.02) : 0.0001;
-    const targetRoad = want && onRoad ? 0.018 + spd * 0.00004 : want ? 0.01 : 0.0001;
+    const targetEng = want ? (onRoad ? 0.08 + spd * 0.0002 : 0.035) : 0.0001;
+    const targetRoad = want && onRoad ? 0.04 + spd * 0.00008 : want ? 0.02 : 0.0001;
     engineGain.gain.setTargetAtTime(targetEng, t, 0.08);
     roadGain.gain.setTargetAtTime(targetRoad, t, 0.1);
-    if (engineOsc) {
-      engineOsc.frequency.setTargetAtTime(55 + spd * 0.55, t, 0.08);
-    }
+    if (engineOsc) engineOsc.frequency.setTargetAtTime(55 + spd * 0.55, t, 0.08);
     if (engineFilter) {
       engineFilter.frequency.setTargetAtTime(onRoad ? 380 + spd * 1.2 : 220, t, 0.1);
     }
@@ -311,6 +333,7 @@
         if (["ArrowLeft", "a", "A"].includes(e.key)) keys.add("L");
         if (["ArrowRight", "d", "D"].includes(e.key)) keys.add("R");
         if ((e.key === " " || e.key === "Enter") && state.phase !== "race") startRace();
+        if (e.key === "m" || e.key === "M") toggleSound();
         e.preventDefault();
       },
       { passive: false }
@@ -321,13 +344,14 @@
     });
 
     const onDown = (e) => {
-      ensureAudio();
-      startBgm();
+      // Mute button: unlock AudioContext + toggle. Does NOT start the race.
       if (hitMute(e.clientX, e.clientY)) {
         toggleSound();
         e.preventDefault();
         return;
       }
+      // Other taps may unlock audio if already enabled, but never auto-unmute.
+      if (soundOn) ensureAudio();
       canvas.setPointerCapture?.(e.pointerId);
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
       updateHolds();
@@ -488,13 +512,16 @@
   }
 
   function startRace() {
-    ensureAudio();
-    startBgm();
+    if (soundOn) {
+      ensureAudio().then(() => {
+        startBgm(false);
+        beep(440, 0.08, "triangle", 0.12);
+      });
+    }
     resetCar();
     state.phase = "countdown";
     state.countdown = 3.2;
     state.message = "";
-    beep(440, 0.08, "triangle", 0.1);
   }
 
   function onFinish() {
@@ -516,8 +543,6 @@
   function update(dt) {
     if (state.messageT > 0) state.messageT -= dt;
     if (state.shake > 0) state.shake -= dt;
-    pumpBgm();
-
     if (state.phase === "countdown") {
       const prevStage = state.countdown > 2.1 ? 0 : state.countdown > 1.05 ? 1 : 2;
       state.countdown -= dt;
@@ -1242,6 +1267,13 @@
     ctx.fillStyle = "#6a3d28";
     ctx.font = '800 14px "Trebuchet MS", sans-serif';
     ctx.fillText("按住猫爪左右漂移", VW / 2, btnY + 62);
+    ctx.font = '700 13px "Trebuchet MS", sans-serif';
+    ctx.fillStyle = soundOn ? "#2f9a52" : "#8a5a40";
+    ctx.fillText(
+      soundOn ? "声音已开 · 背景音乐播放中" : "点击右上角喇叭开启声音",
+      VW / 2,
+      btnY + 84
+    );
 
     const pawY = VH - 58;
     drawPaw("paw_l", 52, pawY, 72, 1);
@@ -1488,6 +1520,8 @@
     let dt = (now - last) / 1000;
     last = now;
     if (dt > 0.033) dt = 0.033;
+    // Keep BGM scheduling every frame while unmuted (title/race/done).
+    pumpBgm();
     if (ready) update(dt);
     draw();
     requestAnimationFrame(loop);
@@ -1501,7 +1535,19 @@
     get soundOn() {
       return soundOn;
     },
+    get audioDebug() {
+      return {
+        soundOn,
+        bgmPlaying,
+        bgmStepIndex,
+        ctxState: actx ? actx.state : "none",
+        masterGain: master ? master.gain.value : null,
+        audioReady,
+      };
+    },
     toggleSound,
+    ensureAudio,
+    sfxHit,
     startRace,
     resize,
     props,
