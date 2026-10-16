@@ -33,26 +33,49 @@
   let roadGain = null;
   let audioReady = false;
 
-  function ensureAudio() {
-    if (!actx) {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) return Promise.resolve(false);
-      actx = new AC();
-      master = actx.createGain();
-      master.gain.value = 0.0001;
-      master.connect(actx.destination);
-      musicBus = actx.createGain();
-      musicBus.gain.value = 0.85;
-      musicBus.connect(master);
-      sfxBus = actx.createGain();
-      sfxBus.gain.value = 1;
-      sfxBus.connect(master);
-      setupEngineNodes();
+  function createAudioGraph() {
+    if (actx) return true;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return false;
+    actx = new AC();
+    master = actx.createGain();
+    master.gain.value = 0.0001;
+    master.connect(actx.destination);
+    musicBus = actx.createGain();
+    musicBus.gain.value = 0.9;
+    musicBus.connect(master);
+    sfxBus = actx.createGain();
+    sfxBus.gain.value = 1;
+    sfxBus.connect(master);
+    setupEngineNodes();
+    return true;
+  }
+
+  /** Must run synchronously inside a tap/click handler (iOS/Android unlock). */
+  function unlockAudioSync() {
+    if (!createAudioGraph()) return Promise.resolve(false);
+    try {
+      const buf = actx.createBuffer(1, 1, actx.sampleRate);
+      const src = actx.createBufferSource();
+      src.buffer = buf;
+      src.connect(master);
+      src.start(0);
+    } catch (_) {
+      /* ignore */
     }
     const resume =
-      actx.state === "suspended" ? actx.resume().catch(() => {}) : Promise.resolve();
+      actx.state === "suspended" || actx.state === "interrupted"
+        ? actx.resume().catch(() => {})
+        : Promise.resolve();
     return resume.then(() => {
-      audioReady = actx.state === "running" || actx.state === "suspended";
+      audioReady = !!actx && actx.state === "running";
+      return audioReady || !!actx;
+    });
+  }
+
+  function ensureAudio() {
+    return unlockAudioSync().then((ok) => {
+      if (!ok) return false;
       applyMute(true);
       return true;
     });
@@ -61,7 +84,7 @@
   function applyMute(instant) {
     if (!actx || !master) return;
     const t = actx.currentTime;
-    const vol = soundOn ? 0.55 : 0.0001;
+    const vol = soundOn ? 0.6 : 0.0001;
     master.gain.cancelScheduledValues(t);
     if (instant) master.gain.setValueAtTime(vol, t);
     else master.gain.setTargetAtTime(vol, t, 0.04);
@@ -69,18 +92,40 @@
     else stopBgm();
   }
 
+  function isAudioLive() {
+    return !!(actx && actx.state === "running" && bgmPlaying && soundOn);
+  }
+
   function toggleSound() {
-    soundOn = !soundOn;
+    // If UI says "on" but audio never unlocked (common after refresh),
+    // this tap should START music — not turn it off.
+    const live = isAudioLive();
+    if (soundOn && live) {
+      soundOn = false;
+    } else {
+      soundOn = true;
+    }
     localStorage.setItem("meowdrift_sound", soundOn ? "1" : "0");
-    ensureAudio().then(() => {
+
+    // Unlock + first notes in the same user gesture whenever possible.
+    const unlockP = unlockAudioSync();
+    if (soundOn) {
+      applyMute(true);
+      startBgm(true);
+      pumpBgm();
+      beep(784, 0.1, "sine", 0.25);
+      setTimeout(() => beep(988, 0.12, "triangle", 0.2), 90);
+    } else {
+      applyMute(true);
+      updateDriveAudio(false, 0);
+    }
+
+    unlockP.then(() => {
+      if (!actx) return;
       applyMute(true);
       if (soundOn) {
         startBgm(true);
-        // audible click so user knows sound unlocked
-        beep(784, 0.1, "sine", 0.22);
-        setTimeout(() => beep(988, 0.12, "triangle", 0.18), 90);
-      } else {
-        updateDriveAudio(false, 0);
+        pumpBgm();
       }
     });
   }
@@ -173,7 +218,11 @@
 
   function pumpBgm() {
     if (!actx || !musicBus || !bgmPlaying || !soundOn) return;
-    if (actx.state !== "running") return;
+    // Keep trying to resume if a mobile browser suspended us again.
+    if (actx.state !== "running") {
+      actx.resume().catch(() => {});
+      return;
+    }
     const now = actx.currentTime;
     // avoid scheduling storms after tab sleep
     if (bgmNextT < now - 0.05) bgmNextT = now + 0.01;
@@ -186,7 +235,7 @@
       o.type = bgmStepIndex % 8 < 4 ? "triangle" : "square";
       o.frequency.value = freq;
       g.gain.setValueAtTime(0.0001, t0);
-      g.gain.exponentialRampToValueAtTime(0.22, t0 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.28, t0 + 0.02);
       g.gain.exponentialRampToValueAtTime(0.0001, t0 + BGM_STEP * 0.85);
       o.connect(g);
       g.connect(musicBus);
@@ -199,7 +248,7 @@
         b.type = "sine";
         b.frequency.value = freq / 2;
         bg.gain.setValueAtTime(0.0001, t0);
-        bg.gain.exponentialRampToValueAtTime(0.16, t0 + 0.02);
+        bg.gain.exponentialRampToValueAtTime(0.2, t0 + 0.02);
         bg.gain.exponentialRampToValueAtTime(0.0001, t0 + BGM_STEP * 1.5);
         b.connect(bg);
         bg.connect(musicBus);
@@ -292,7 +341,8 @@
     ctx.closePath();
     ctx.fill();
 
-    if (soundOn) {
+    // Waves only when audio is actually live (not just a saved preference).
+    if (isAudioLive()) {
       ctx.strokeStyle = "#ffe066";
       ctx.lineWidth = 2.2;
       ctx.beginPath();
@@ -1268,9 +1318,10 @@
     ctx.font = '800 14px "Trebuchet MS", sans-serif';
     ctx.fillText("按住猫爪左右漂移", VW / 2, btnY + 62);
     ctx.font = '700 13px "Trebuchet MS", sans-serif';
-    ctx.fillStyle = soundOn ? "#2f9a52" : "#8a5a40";
+    const live = isAudioLive();
+    ctx.fillStyle = live ? "#2f9a52" : "#8a5a40";
     ctx.fillText(
-      soundOn ? "声音已开 · 背景音乐播放中" : "点击右上角喇叭开启声音",
+      live ? "声音已开 · 背景音乐播放中" : "点击右上角喇叭开启音乐",
       VW / 2,
       btnY + 84
     );
@@ -1540,6 +1591,7 @@
         soundOn,
         bgmPlaying,
         bgmStepIndex,
+        live: isAudioLive(),
         ctxState: actx ? actx.state : "none",
         masterGain: master ? master.gain.value : null,
         audioReady,
