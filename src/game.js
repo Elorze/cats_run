@@ -16,22 +16,59 @@
   const PATH = (meta.path || []).map((p) => ({ x: p[0], y: p[1] }));
   const TRACK_HALF = 50;
 
-  // ---- Audio ----
+  // ---- Audio (procedural Web Audio — no external files) ----
   let actx = null;
   let master = null;
+  let musicBus = null;
+  let sfxBus = null;
+  let soundOn = localStorage.getItem("meowdrift_sound") !== "0";
+  let bgmPlaying = false;
+  let bgmNextT = 0;
+  let engineOsc = null;
+  let engineFilter = null;
+  let engineGain = null;
+  let roadNoise = null;
+  let roadGain = null;
+
   function ensureAudio() {
     if (!actx) {
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return;
       actx = new AC();
       master = actx.createGain();
-      master.gain.value = 0.2;
+      master.gain.value = soundOn ? 0.24 : 0.0001;
       master.connect(actx.destination);
+      musicBus = actx.createGain();
+      musicBus.gain.value = 0.32;
+      musicBus.connect(master);
+      sfxBus = actx.createGain();
+      sfxBus.gain.value = 0.7;
+      sfxBus.connect(master);
+      setupEngineNodes();
     }
     if (actx.state === "suspended") actx.resume();
+    applyMute();
   }
-  function beep(freq, dur, type, vol) {
+
+  function applyMute() {
     if (!actx || !master) return;
+    const t = actx.currentTime;
+    master.gain.cancelScheduledValues(t);
+    master.gain.setTargetAtTime(soundOn ? 0.24 : 0.0001, t, 0.03);
+    if (soundOn) startBgm();
+    else stopBgm();
+  }
+
+  function toggleSound() {
+    soundOn = !soundOn;
+    localStorage.setItem("meowdrift_sound", soundOn ? "1" : "0");
+    ensureAudio();
+    applyMute();
+    if (soundOn) beep(660, 0.07, "sine", 0.08);
+  }
+
+  function beep(freq, dur, type, vol) {
+    if (!actx || !sfxBus || !soundOn) return;
     const t = actx.currentTime;
     const o = actx.createOscillator();
     const g = actx.createGain();
@@ -41,9 +78,216 @@
     g.gain.exponentialRampToValueAtTime(vol || 0.15, t + 0.01);
     g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     o.connect(g);
-    g.connect(master);
+    g.connect(sfxBus);
     o.start(t);
     o.stop(t + dur + 0.02);
+  }
+
+  function noiseBuffer(seconds) {
+    const n = Math.max(1, (actx.sampleRate * seconds) | 0);
+    const buf = actx.createBuffer(1, n, actx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+    return buf;
+  }
+
+  function sfxHit() {
+    if (!actx || !sfxBus || !soundOn) return;
+    const t = actx.currentTime;
+    // low thump
+    const o = actx.createOscillator();
+    const g = actx.createGain();
+    o.type = "triangle";
+    o.frequency.setValueAtTime(140, t);
+    o.frequency.exponentialRampToValueAtTime(48, t + 0.18);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.28, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+    o.connect(g);
+    g.connect(sfxBus);
+    o.start(t);
+    o.stop(t + 0.24);
+    // noise slap
+    const src = actx.createBufferSource();
+    src.buffer = noiseBuffer(0.15);
+    const f = actx.createBiquadFilter();
+    f.type = "bandpass";
+    f.frequency.value = 900;
+    f.Q.value = 0.7;
+    const ng = actx.createGain();
+    ng.gain.setValueAtTime(0.0001, t);
+    ng.gain.exponentialRampToValueAtTime(0.18, t + 0.005);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+    src.connect(f);
+    f.connect(ng);
+    ng.connect(sfxBus);
+    src.start(t);
+    src.stop(t + 0.15);
+  }
+
+  function sfxFinish() {
+    beep(523, 0.1, "sine", 0.14);
+    setTimeout(() => beep(659, 0.1, "sine", 0.14), 80);
+    setTimeout(() => beep(784, 0.18, "triangle", 0.16), 160);
+  }
+
+  // Cute looping chiptune BGM (C major-ish arpeggio)
+  const BGM_NOTES = [
+    523.25, 659.25, 783.99, 1046.5, 783.99, 659.25, 587.33, 659.25,
+    392.0, 523.25, 659.25, 783.99, 659.25, 523.25, 440.0, 523.25,
+  ];
+  const BGM_STEP = 0.22;
+
+  function startBgm() {
+    if (!actx || !musicBus || !soundOn) return;
+    if (!bgmPlaying) {
+      bgmPlaying = true;
+      bgmNextT = actx.currentTime + 0.05;
+    }
+  }
+
+  function stopBgm() {
+    bgmPlaying = false;
+  }
+
+  function pumpBgm() {
+    if (!actx || !musicBus || !bgmPlaying || !soundOn) return;
+    const now = actx.currentTime;
+    while (bgmNextT < now + 0.8) {
+      const i = Math.floor((bgmNextT * 1000) / (BGM_STEP * 1000)) % BGM_NOTES.length;
+      const freq = BGM_NOTES[i];
+      const t0 = bgmNextT;
+      const o = actx.createOscillator();
+      const g = actx.createGain();
+      o.type = i % 8 < 4 ? "triangle" : "sine";
+      o.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.09, t0 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + BGM_STEP * 0.9);
+      o.connect(g);
+      g.connect(musicBus);
+      o.start(t0);
+      o.stop(t0 + BGM_STEP);
+      // soft bass every 4 steps
+      if (i % 4 === 0) {
+        const b = actx.createOscillator();
+        const bg = actx.createGain();
+        b.type = "sine";
+        b.frequency.value = freq / 2;
+        bg.gain.setValueAtTime(0.0001, t0);
+        bg.gain.exponentialRampToValueAtTime(0.06, t0 + 0.02);
+        bg.gain.exponentialRampToValueAtTime(0.0001, t0 + BGM_STEP * 1.6);
+        b.connect(bg);
+        bg.connect(musicBus);
+        b.start(t0);
+        b.stop(t0 + BGM_STEP * 1.7);
+      }
+      bgmNextT += BGM_STEP;
+    }
+  }
+
+  function setupEngineNodes() {
+    engineOsc = actx.createOscillator();
+    engineOsc.type = "sawtooth";
+    engineOsc.frequency.value = 70;
+    engineFilter = actx.createBiquadFilter();
+    engineFilter.type = "lowpass";
+    engineFilter.frequency.value = 420;
+    engineFilter.Q.value = 0.8;
+    engineGain = actx.createGain();
+    engineGain.gain.value = 0.0001;
+    engineOsc.connect(engineFilter);
+    engineFilter.connect(engineGain);
+    engineGain.connect(sfxBus);
+    engineOsc.start();
+
+    roadNoise = actx.createBufferSource();
+    roadNoise.buffer = noiseBuffer(1.2);
+    roadNoise.loop = true;
+    const nf = actx.createBiquadFilter();
+    nf.type = "bandpass";
+    nf.frequency.value = 700;
+    nf.Q.value = 0.6;
+    roadGain = actx.createGain();
+    roadGain.gain.value = 0.0001;
+    roadNoise.connect(nf);
+    nf.connect(roadGain);
+    roadGain.connect(sfxBus);
+    roadNoise.start();
+  }
+
+  function updateDriveAudio(onRoad, speed) {
+    if (!actx || !engineGain || !roadGain) return;
+    const t = actx.currentTime;
+    const racing = state.phase === "race";
+    const want = racing && soundOn;
+    const spd = Math.max(0, speed);
+    // engine pitch/level rises with speed; louder on asphalt
+    const targetEng = want ? (onRoad ? 0.045 + spd * 0.00012 : 0.02) : 0.0001;
+    const targetRoad = want && onRoad ? 0.018 + spd * 0.00004 : want ? 0.01 : 0.0001;
+    engineGain.gain.setTargetAtTime(targetEng, t, 0.08);
+    roadGain.gain.setTargetAtTime(targetRoad, t, 0.1);
+    if (engineOsc) {
+      engineOsc.frequency.setTargetAtTime(55 + spd * 0.55, t, 0.08);
+    }
+    if (engineFilter) {
+      engineFilter.frequency.setTargetAtTime(onRoad ? 380 + spd * 1.2 : 220, t, 0.1);
+    }
+  }
+
+  function muteBtn() {
+    return { x: VW - 36, y: 36, r: 20 };
+  }
+
+  function hitMute(clientX, clientY) {
+    const x = (clientX / Math.max(1, window.innerWidth)) * VW;
+    const y = (clientY / Math.max(1, window.innerHeight)) * VH;
+    const b = muteBtn();
+    return Math.hypot(x - b.x, y - b.y) <= b.r + 10;
+  }
+
+  function drawMuteButton() {
+    const b = muteBtn();
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.fillStyle = "rgba(59,36,28,0.82)";
+    ctx.beginPath();
+    ctx.arc(0, 0, b.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "#fff6e8";
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    // speaker body
+    ctx.fillStyle = "#fff6e8";
+    ctx.beginPath();
+    ctx.moveTo(-8, -5);
+    ctx.lineTo(-2, -5);
+    ctx.lineTo(5, -11);
+    ctx.lineTo(5, 11);
+    ctx.lineTo(-2, 5);
+    ctx.lineTo(-8, 5);
+    ctx.closePath();
+    ctx.fill();
+
+    if (soundOn) {
+      ctx.strokeStyle = "#ffe066";
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      ctx.arc(6, 0, 5, -0.7, 0.7);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(6, 0, 9, -0.7, 0.7);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = "#ff8fbf";
+      ctx.lineWidth = 2.8;
+      ctx.beginPath();
+      ctx.moveTo(-10, -10);
+      ctx.lineTo(10, 10);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   // ---- Input ----
@@ -78,6 +322,12 @@
 
     const onDown = (e) => {
       ensureAudio();
+      startBgm();
+      if (hitMute(e.clientX, e.clientY)) {
+        toggleSound();
+        e.preventDefault();
+        return;
+      }
       canvas.setPointerCapture?.(e.pointerId);
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
       updateHolds();
@@ -239,6 +489,7 @@
 
   function startRace() {
     ensureAudio();
+    startBgm();
     resetCar();
     state.phase = "countdown";
     state.countdown = 3.2;
@@ -257,19 +508,20 @@
       state.best = state.time;
       localStorage.setItem("meowdrift_best", String(state.best));
     }
-    beep(523, 0.1, "sine", 0.14);
-    setTimeout(() => beep(659, 0.1, "sine", 0.14), 80);
-    setTimeout(() => beep(784, 0.18, "triangle", 0.16), 160);
+    updateDriveAudio(false, 0);
+    sfxFinish();
   }
 
   // ---- Update ----
   function update(dt) {
     if (state.messageT > 0) state.messageT -= dt;
     if (state.shake > 0) state.shake -= dt;
+    pumpBgm();
 
     if (state.phase === "countdown") {
       const prevStage = state.countdown > 2.1 ? 0 : state.countdown > 1.05 ? 1 : 2;
       state.countdown -= dt;
+      updateDriveAudio(true, 0);
       if (state.countdown <= 0) {
         state.phase = "race";
         state.speed = 210;
@@ -283,7 +535,10 @@
       return;
     }
 
-    if (state.phase !== "race") return;
+    if (state.phase !== "race") {
+      updateDriveAudio(false, 0);
+      return;
+    }
 
     state.time += dt;
 
@@ -297,10 +552,12 @@
       state.slowT -= dt;
       target = 95;
     }
-    if (distToPath(state.x, state.y) > TRACK_HALF * 0.92) {
+    const onRoad = distToPath(state.x, state.y) <= TRACK_HALF * 0.92;
+    if (!onRoad) {
       target = Math.min(target, 70);
     }
     state.speed += (target - state.speed) * Math.min(1, 2.2 * dt);
+    updateDriveAudio(onRoad, state.speed);
 
     // drift: velocity blends toward heading
     const hx = Math.cos(state.angle);
@@ -365,7 +622,7 @@
         state._vx *= 0.35;
         state._vy *= 0.35;
         state.shake = 0.16;
-        beep(96, 0.14, "triangle", 0.16);
+        sfxHit();
       }
     }
   }
@@ -967,9 +1224,6 @@
     drawVectorCat(1.15);
     ctx.restore();
 
-    drawGear(36, 36);
-    drawTrophy(VW - 36, 38);
-
     drawBrandLogo(VW / 2, 28);
     const subW = Math.min(VW * 0.86, 340);
     const subY = 132;
@@ -992,6 +1246,7 @@
     const pawY = VH - 58;
     drawPaw("paw_l", 52, pawY, 72, 1);
     drawPaw("paw_r", VW - 52, pawY, 72, 1);
+    drawMuteButton();
   }
 
   function drawBrandLogo(x, y) {
@@ -1157,6 +1412,7 @@
     const s = 76 * pulse;
     drawPaw("paw_l", 56, pawY, s, wantLeft() ? 1 : 0.78);
     drawPaw("paw_r", VW - 56, pawY, s, wantRight() ? 1 : 0.78);
+    drawMuteButton();
   }
 
   function drawPaw(key, x, y, size, alpha) {
@@ -1242,6 +1498,10 @@
     get state() {
       return state;
     },
+    get soundOn() {
+      return soundOn;
+    },
+    toggleSound,
     startRace,
     resize,
     props,
