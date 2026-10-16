@@ -1,0 +1,13 @@
+---
+description: 修改 cats_run 后自动提交并推送到 GitHub 主分支
+alwaysApply: true
+---
+
+# 自动推送
+
+在 `littlethings/riflle/cats_run` 里完成代码或资源修改后，不要停在本地：
+
+1. 确认当前在 `main`。若在其他分支，先把改动合并进 `main` 再推送。
+2. 提交有意义的改动（不要提交密钥、`.env`、调试截图）。
+3. 执行 `git push origin main`。
+4. 推送失败时说明原因，不要改 git config，不要 force push。

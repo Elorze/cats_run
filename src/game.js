@@ -14,13 +14,7 @@
 
   const meta = window.TRACK_META || { width: 720, height: 1291, path: [], finishIndex: 0, startIndex: 0 };
   const PATH = (meta.path || []).map((p) => ({ x: p[0], y: p[1] }));
-  const WORLD_W = meta.width || 720;
-  const WORLD_H = meta.height || 1291;
-
-  // Offscreen track for pixel sampling (on-road test)
-  const sampleCanvas = document.createElement("canvas");
-  const sampleCtx = sampleCanvas.getContext("2d", { willReadFrequently: true });
-  let sampleReady = false;
+  const TRACK_HALF = 50;
 
   // ---- Audio ----
   let actx = null;
@@ -143,9 +137,63 @@
   }
 
   function progressOf(idx) {
-    const n = PATH.length - 1;
+    const n = Math.max(1, PATH.length - 1);
     return ((idx % n) + n) % n;
   }
+
+  function segDist(px, py, ax, ay, bx, by) {
+    const abx = bx - ax;
+    const aby = by - ay;
+    const ab2 = abx * abx + aby * aby || 1;
+    let t = ((px - ax) * abx + (py - ay) * aby) / ab2;
+    t = Math.max(0, Math.min(1, t));
+    return Math.hypot(px - (ax + abx * t), py - (ay + aby * t));
+  }
+
+  function distToPath(x, y) {
+    let best = 1e9;
+    const n = PATH.length - 1;
+    for (let i = 0; i < n; i++) {
+      const a = PATH[i];
+      const b = PATH[i + 1];
+      const d = segDist(x, y, a.x, a.y, b.x, b.y);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  function buildProps() {
+    const obstacles = [];
+    const scenery = [];
+    const n = PATH.length - 1;
+    if (n < 8) return { obstacles, scenery };
+    const kinds = ["tire", "yarn", "bush"];
+    for (let i = 6; i < n; i += 13) {
+      const p = PATH[i];
+      const t = pathTangent(i);
+      const nx = -t.y;
+      const ny = t.x;
+      const t2 = pathTangent((i + 4) % n);
+      const cross = t.x * t2.y - t.y * t2.x;
+      const side = cross >= 0 ? 1 : -1;
+      const kind = kinds[((i / 13) | 0) % kinds.length];
+      obstacles.push({
+        x: p.x + nx * side * TRACK_HALF * 0.62,
+        y: p.y + ny * side * TRACK_HALF * 0.62,
+        r: kind === "tire" ? 20 : 16,
+        kind,
+        cool: 0,
+      });
+      scenery.push({
+        x: p.x - nx * side * (TRACK_HALF + 34),
+        y: p.y - ny * side * (TRACK_HALF + 34),
+        kind: i % 2 === 0 ? "bush" : "paw",
+      });
+    }
+    return { obstacles, scenery };
+  }
+
+  const props = buildProps();
 
   // ---- Game state ----
   const state = {
@@ -162,6 +210,7 @@
     crossedFinish: false,
     trails: [],
     shake: 0,
+    slowT: 0,
     message: "",
     messageT: 0,
     offRoadT: 0,
@@ -169,7 +218,7 @@
 
   function resetCar() {
     const si = meta.startIndex || 0;
-    const p = PATH[si] || { x: WORLD_W * 0.8, y: WORLD_H * 0.5 };
+    const p = PATH[si] || PATH[0] || { x: 400, y: 600 };
     const t = pathTangent(si);
     state.x = p.x;
     state.y = p.y;
@@ -181,6 +230,7 @@
     state.trails = [];
     state.time = 0;
     state.offRoadT = 0;
+    state.slowT = 0;
     state._vx = 0;
     state._vy = 0;
     state._traveled = 0;
@@ -195,14 +245,6 @@
     beep(440, 0.08, "triangle", 0.1);
   }
 
-  function onCrash() {
-    state.phase = "crash";
-    state.message = "出界啦 — 点屏幕重开";
-    state.messageT = 2;
-    state.shake = 0.25;
-    beep(140, 0.2, "sawtooth", 0.12);
-  }
-
   function onFinish() {
     state.phase = "done";
     state.message = "冲线！";
@@ -214,21 +256,6 @@
     beep(523, 0.1, "sine", 0.14);
     setTimeout(() => beep(659, 0.1, "sine", 0.14), 80);
     setTimeout(() => beep(784, 0.18, "triangle", 0.16), 160);
-  }
-
-  // ---- On-track sampling ----
-  function isOnTrack(wx, wy) {
-    if (!sampleReady) return true;
-    const x = Math.round(wx);
-    const y = Math.round(wy);
-    if (x < 0 || y < 0 || x >= sampleCanvas.width || y >= sampleCanvas.height) return false;
-    const d = sampleCtx.getImageData(x, y, 1, 1).data;
-    // grass is bright green; asphalt is dark gray
-    const bri = (d[0] + d[1] + d[2]) / 3;
-    const greenish = d[1] > d[0] + 15 && d[1] > d[2] + 10 && bri > 120;
-    if (greenish) return false;
-    // accept dark asphalt / curb / finish (checkered has black+white — sample nearby)
-    return bri < 175 || (Math.abs(d[0] - d[1]) < 25 && bri < 210);
   }
 
   // ---- Update ----
@@ -254,9 +281,16 @@
     const turnRate = 2.8 + state.speed * 0.002;
     state.angle += steer * turnRate * dt;
 
-    // accelerate / soft cap
-    const target = 230 + Math.min(80, state.time * 3);
-    state.speed += (target - state.speed) * Math.min(1, 2 * dt);
+    // Hits and grass hold the speed cap down so the slowdown is felt.
+    let target = 230 + Math.min(80, state.time * 3);
+    if (state.slowT > 0) {
+      state.slowT -= dt;
+      target = 95;
+    }
+    if (distToPath(state.x, state.y) > TRACK_HALF * 0.92) {
+      target = Math.min(target, 70);
+    }
+    state.speed += (target - state.speed) * Math.min(1, 2.2 * dt);
 
     // drift: velocity blends toward heading
     const hx = Math.cos(state.angle);
@@ -309,18 +343,18 @@
       return;
     }
 
-    // off-track: sample a few points under the cat
-    const on =
-      isOnTrack(state.x, state.y) &&
-      isOnTrack(state.x + hx * 10, state.y + hy * 10) &&
-      isOnTrack(state.x - hy * 8, state.y + hx * 8) &&
-      isOnTrack(state.x + hy * 8, state.y - hx * 8);
-
-    if (!on) {
-      state.offRoadT += dt;
-      if (state.offRoadT > 0.12) onCrash();
-    } else {
-      state.offRoadT = Math.max(0, state.offRoadT - dt * 2);
+    for (const o of props.obstacles) {
+      if (o.cool > 0) o.cool -= dt;
+      const d = Math.hypot(state.x - o.x, state.y - o.y);
+      if (d < o.r + 18 && o.cool <= 0) {
+        o.cool = 0.7;
+        state.slowT = 0.85;
+        state.speed *= 0.35;
+        state._vx *= 0.35;
+        state._vy *= 0.35;
+        state.shake = 0.16;
+        beep(96, 0.14, "triangle", 0.16);
+      }
     }
   }
 
@@ -355,6 +389,11 @@
       return;
     }
 
+    if (state.phase === "title") {
+      drawTitle();
+      return;
+    }
+
     const scale = camScale();
     let shakeX = 0;
     let shakeY = 0;
@@ -371,10 +410,7 @@
     ctx.scale(scale, scale);
     ctx.translate(-camX, -camY);
 
-    // track world
-    if (img.track) {
-      ctx.drawImage(img.track, 0, 0, WORLD_W, WORLD_H);
-    }
+    drawWorld();
 
     // drift trails
     for (const t of state.trails) {
@@ -392,6 +428,134 @@
     ctx.restore();
 
     drawUI();
+  }
+
+  function tracePath() {
+    if (!PATH.length) return;
+    ctx.beginPath();
+    ctx.moveTo(PATH[0].x, PATH[0].y);
+    for (let i = 1; i < PATH.length; i++) ctx.lineTo(PATH[i].x, PATH[i].y);
+    ctx.closePath();
+  }
+
+  function drawWorld() {
+    ctx.fillStyle = "#b7e6c9";
+    ctx.fillRect(state.x - 2500, state.y - 2500, 5000, 5000);
+
+    if (PATH.length < 2) return;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    tracePath();
+    ctx.strokeStyle = "#2a2d32";
+    ctx.lineWidth = TRACK_HALF * 2 + 16;
+    ctx.stroke();
+    ctx.strokeStyle = "#5c616a";
+    ctx.lineWidth = TRACK_HALF * 2;
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(255,255,255,0.22)";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    drawCurbs();
+    drawFinish();
+    for (const s of props.scenery) drawScenery(s);
+    for (const o of props.obstacles) drawObstacle(o);
+  }
+
+  function drawCurbs() {
+    const n = PATH.length - 1;
+    for (let i = 0; i < n; i += 4) {
+      const t = pathTangent(i);
+      const t2 = pathTangent((i + 3) % n);
+      const cross = t.x * t2.y - t.y * t2.x;
+      if (Math.abs(cross) < 0.18) continue;
+      const p = PATH[i];
+      const side = cross > 0 ? 1 : -1;
+      const nx = -t.y * side;
+      const ny = t.x * side;
+      ctx.save();
+      ctx.translate(p.x + nx * (TRACK_HALF + 2), p.y + ny * (TRACK_HALF + 2));
+      ctx.rotate(Math.atan2(t.y, t.x));
+      for (let k = 0; k < 3; k++) {
+        ctx.fillStyle = k % 2 ? "#e23b3b" : "#fff";
+        ctx.fillRect(-7 + k * 5, -5, 5, 10);
+      }
+      ctx.restore();
+    }
+  }
+
+  function drawFinish() {
+    const n = PATH.length - 1;
+    if (!n) return;
+    const i = meta.finishIndex || 0;
+    const p = PATH[i];
+    const t = pathTangent(i);
+    const ang = Math.atan2(t.y, t.x);
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(ang + Math.PI / 2);
+    const cells = 10;
+    const cw = (TRACK_HALF * 2) / cells;
+    for (let k = 0; k < cells; k++) {
+      ctx.fillStyle = k % 2 ? "#111" : "#fff";
+      ctx.fillRect(-TRACK_HALF + k * cw, -7, cw + 0.5, 14);
+    }
+    ctx.restore();
+  }
+
+  function drawObstacle(o) {
+    if (o.kind === "tire") {
+      ctx.fillStyle = "#1c1c1c";
+      ctx.beginPath();
+      ctx.arc(o.x - 6, o.y, 11, 0, Math.PI * 2);
+      ctx.arc(o.x + 7, o.y + 2, 11, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#3a3a3a";
+      ctx.beginPath();
+      ctx.arc(o.x - 6, o.y, 5, 0, Math.PI * 2);
+      ctx.arc(o.x + 7, o.y + 2, 5, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (o.kind === "yarn") {
+      const colors = ["#ff8fb8", "#7ec8ff", "#ffe066"];
+      ctx.fillStyle = colors[(o.x | 0) % 3];
+      ctx.beginPath();
+      ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(80,40,40,0.35)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(o.x, o.y, o.r * 0.55, 0.2, 2.4);
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = "#3e9a55";
+      ctx.beginPath();
+      ctx.arc(o.x, o.y - 4, 12, 0, Math.PI * 2);
+      ctx.arc(o.x - 10, o.y + 4, 10, 0, Math.PI * 2);
+      ctx.arc(o.x + 10, o.y + 4, 10, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawScenery(s) {
+    if (s.kind === "bush") {
+      ctx.fillStyle = "#2f8a49";
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, 14, 0, Math.PI * 2);
+      ctx.arc(s.x - 12, s.y + 6, 11, 0, Math.PI * 2);
+      ctx.arc(s.x + 12, s.y + 6, 11, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = "rgba(255,143,184,0.85)";
+      ctx.beginPath();
+      ctx.ellipse(s.x, s.y + 4, 7, 6, 0, 0, Math.PI * 2);
+      ctx.fill();
+      for (let k = 0; k < 3; k++) {
+        const a = -0.8 + k * 0.8;
+        ctx.beginPath();
+        ctx.arc(s.x + Math.cos(a) * 7, s.y - 4 + Math.sin(a) * 4, 3.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
   }
 
   function drawCat() {
@@ -423,63 +587,335 @@
     return String(s).padStart(2, "0") + ":" + String(cs).padStart(2, "0");
   }
 
-  function drawUI() {
-    // timer
-    ctx.textAlign = "center";
-    ctx.font = "bold 28px system-ui,Segoe UI,sans-serif";
+  function titlePoint(t) {
+    const p0 = { x: -VW * 0.08, y: VH * 0.58 };
+    const p1 = { x: VW * 0.42, y: VH * 0.46 };
+    const p2 = { x: VW * 1.08, y: VH * 0.55 };
+    const u = 1 - t;
+    return {
+      x: u * u * p0.x + 2 * u * t * p1.x + t * t * p2.x,
+      y: u * u * p0.y + 2 * u * t * p1.y + t * t * p2.y,
+    };
+  }
+
+  function titleTangent(t) {
+    const a = titlePoint(Math.max(0, t - 0.012));
+    const b = titlePoint(Math.min(1, t + 0.012));
+    return Math.atan2(b.y - a.y, b.x - a.x);
+  }
+
+  function drawGrassTuft(x, y, s) {
+    ctx.fillStyle = "#7dca8e";
+    for (let i = -1; i <= 1; i++) {
+      ctx.beginPath();
+      ctx.ellipse(x + i * 3.2 * s, y, 2.2 * s, 7 * s, i * 0.35, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawBush(x, y, s) {
+    ctx.fillStyle = "#2f9a52";
+    ctx.beginPath();
+    ctx.arc(x, y - 6 * s, 16 * s, 0, Math.PI * 2);
+    ctx.arc(x - 14 * s, y + 4 * s, 13 * s, 0, Math.PI * 2);
+    ctx.arc(x + 14 * s, y + 4 * s, 13 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#3eb86a";
+    ctx.beginPath();
+    ctx.arc(x - 2 * s, y - 8 * s, 8 * s, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawYarnBall(x, y, color, r) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(90,40,50,0.28)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(x, y, r * 0.55, 0.4, 2.6);
+    ctx.stroke();
+  }
+
+  function drawGear(x, y) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.fillStyle = "#f2c14e";
+    ctx.strokeStyle = "#6a3d28";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2;
+      ctx.lineTo(Math.cos(a) * 16, Math.sin(a) * 16);
+      ctx.lineTo(Math.cos(a + 0.22) * 11, Math.sin(a + 0.22) * 11);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(0, 0, 5, 0, Math.PI * 2);
+    ctx.fillStyle = "#fff6d8";
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawTrophy(x, y) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.fillStyle = "#f2c14e";
+    ctx.strokeStyle = "#6a3d28";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(-12, -14);
+    ctx.lineTo(12, -14);
+    ctx.quadraticCurveTo(14, 6, 0, 12);
+    ctx.quadraticCurveTo(-14, 6, -12, -14);
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(-14, -6, 6, Math.PI * 0.5, Math.PI * 1.5);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(14, -6, 6, -Math.PI * 0.5, Math.PI * 0.5);
+    ctx.stroke();
+    ctx.fillRect(-8, 12, 16, 4);
+    ctx.fillRect(-11, 16, 22, 5);
+    ctx.strokeRect(-11, 16, 22, 5);
+    ctx.restore();
+  }
+
+  function drawStartButton(x, y) {
+    const pulse = 1 + Math.sin(performance.now() / 280) * 0.025;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(pulse, pulse);
+    ctx.fillStyle = "#ff7eb5";
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.arc(0, 10, 46, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-34, -8);
+    ctx.lineTo(-50, -48);
+    ctx.lineTo(-10, -24);
+    ctx.closePath();
+    ctx.moveTo(34, -8);
+    ctx.lineTo(50, -48);
+    ctx.lineTo(10, -24);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.45)";
+    ctx.beginPath();
+    ctx.ellipse(-12, -8, 18, 10, -0.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.strokeStyle = "#8a3d62";
     ctx.lineWidth = 5;
-    ctx.strokeStyle = "rgba(255,255,255,0.95)";
-    ctx.fillStyle = "#2d3436";
-    const tstr = state.phase === "title" ? "MEOW DRIFT" : fmtTime(state.time);
-    ctx.strokeText(tstr, VW / 2, 48 + (window.safeTop || 0));
-    ctx.fillText(tstr, VW / 2, 48 + (window.safeTop || 0));
+    ctx.lineJoin = "round";
+    ctx.font = '900 22px "Arial Rounded MT Bold", "Trebuchet MS", sans-serif';
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.strokeText("START", 0, 2);
+    ctx.fillText("START", 0, 2);
+    ctx.font = '900 11px "Arial Rounded MT Bold", "Trebuchet MS", sans-serif';
+    ctx.fillStyle = "#ffe56a";
+    ctx.lineWidth = 3;
+    ctx.strokeText("TAP TO PLAY", 0, 22);
+    ctx.fillText("TAP TO PLAY", 0, 22);
+    ctx.restore();
+  }
 
-    if (state.best && state.phase !== "title") {
-      ctx.font = "14px system-ui,sans-serif";
-      ctx.fillStyle = "#5b8a7a";
-      ctx.fillText("BEST " + fmtTime(state.best), VW / 2, 72 + (window.safeTop || 0));
+  function drawTitle() {
+    ctx.fillStyle = "#d7f6e2";
+    ctx.fillRect(0, 0, VW, VH);
+
+    const tufts = [
+      [0.12, 0.22],
+      [0.84, 0.18],
+      [0.08, 0.48],
+      [0.9, 0.46],
+      [0.18, 0.78],
+      [0.78, 0.8],
+      [0.5, 0.86],
+      [0.3, 0.34],
+      [0.7, 0.72],
+    ];
+    for (const [u, v] of tufts) drawGrassTuft(VW * u, VH * v, 1);
+    drawBush(VW * 0.1, VH * 0.3, 1.15);
+    drawBush(VW * 0.9, VH * 0.28, 1);
+    drawBush(VW * 0.14, VH * 0.72, 0.9);
+
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    for (let i = 0; i <= 48; i++) {
+      const p = titlePoint(i / 48);
+      if (i === 0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    }
+    ctx.strokeStyle = "#2a2d32";
+    ctx.lineWidth = Math.min(118, VW * 0.3);
+    ctx.stroke();
+    ctx.strokeStyle = "#5c616a";
+    ctx.lineWidth = Math.min(100, VW * 0.26);
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(255,255,255,0.3)";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    const half = Math.min(50, VW * 0.13);
+    for (let i = 0; i < 16; i++) {
+      const t = 0.06 + i * 0.052;
+      const p = titlePoint(t);
+      const ang = titleTangent(t);
+      const nx = Math.cos(ang + Math.PI / 2);
+      const ny = Math.sin(ang + Math.PI / 2);
+      for (const side of [-1, 1]) {
+        ctx.save();
+        ctx.translate(p.x + nx * side * half, p.y + ny * side * half);
+        ctx.rotate(ang);
+        ctx.fillStyle = i % 2 ? "#ff8fb8" : "#fff";
+        ctx.fillRect(-8, -6, 16, 12);
+        ctx.restore();
+      }
     }
 
-    // countdown
-    if (state.phase === "countdown") {
-      const n = Math.ceil(state.countdown);
-      const label = n >= 3 ? "READY" : n === 2 ? "SET" : "GO!";
-      ctx.font = "bold 64px system-ui,sans-serif";
-      ctx.fillStyle = "#ff6eb4";
-      ctx.strokeStyle = "#fff";
-      ctx.lineWidth = 8;
-      ctx.strokeText(label, VW / 2, VH * 0.4);
-      ctx.fillText(label, VW / 2, VH * 0.4);
+    const ft = 0.78;
+    const fp = titlePoint(ft);
+    const fang = titleTangent(ft);
+    ctx.save();
+    ctx.translate(fp.x, fp.y);
+    ctx.rotate(fang + Math.PI / 2);
+    const cells = 8;
+    const cw = (half * 2) / cells;
+    for (let k = 0; k < cells; k++) {
+      ctx.fillStyle = k % 2 ? "#111" : "#fff";
+      ctx.fillRect(-half + k * cw, -8, cw + 0.6, 16);
     }
+    ctx.restore();
+
+    const yarns = [
+      [0.22, 18, "#ff8fb8", 11],
+      [0.58, -16, "#ffe066", 12],
+      [0.9, 22, "#7ec8ff", 10],
+    ];
+    for (const [t, off, color, r] of yarns) {
+      const p = titlePoint(t);
+      const ang = titleTangent(t);
+      drawYarnBall(
+        p.x + Math.cos(ang + Math.PI / 2) * off,
+        p.y + Math.sin(ang + Math.PI / 2) * off,
+        color,
+        r
+      );
+    }
+
+    const ct = 0.48 + Math.sin(performance.now() / 700) * 0.02;
+    for (let i = 1; i <= 7; i++) {
+      const p = titlePoint(ct - i * 0.035);
+      const ang = titleTangent(ct - i * 0.035);
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(ang);
+      ctx.fillStyle = i % 2 ? "#ff8fb8" : "rgba(255,143,184,0.45)";
+      ctx.beginPath();
+      ctx.ellipse(-10, 0, 7, 3.2, 0, 0, Math.PI * 2);
+      ctx.ellipse(10, 0, 7, 3.2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    const catP = titlePoint(ct);
+    const catA = titleTangent(ct);
+    ctx.save();
+    ctx.translate(catP.x, catP.y);
+    ctx.rotate(catA + Math.PI / 2);
+    const im = img.cat;
+    const w = 54;
+    const h = im ? (im.height / im.width) * w : 74;
+    ctx.fillStyle = "rgba(40,60,40,0.18)";
+    ctx.beginPath();
+    ctx.ellipse(0, 8, 16, 8, 0, 0, Math.PI * 2);
+    ctx.fill();
+    if (im) ctx.drawImage(im, -w / 2, -h / 2, w, h);
+    ctx.restore();
+
+    drawGear(36, 36);
+    drawTrophy(VW - 36, 38);
+
+    const logoW = Math.min(VW * 0.84, 340);
+    drawSprite("ui_meow", VW / 2, 18, logoW);
+    const logoH = img.ui_meow ? logoW * (img.ui_meow.height / img.ui_meow.width) : 120;
+    const subW = Math.min(VW * 0.86, 340);
+    const subY = 18 + logoH + 6;
+    if (img.ui_tap) {
+      const subH = subW * (img.ui_tap.height / img.ui_tap.width);
+      ctx.fillStyle = "#6a3d28";
+      ctx.beginPath();
+      ctx.roundRect(VW / 2 - subW / 2 - 8, subY - 6, subW + 16, subH + 12, 16);
+      ctx.fill();
+      drawSprite("ui_tap", VW / 2, subY, subW);
+    }
+
+    const btnY = VH * 0.73;
+    drawStartButton(VW / 2, btnY);
+    drawSprite("ui_drift", VW / 2, btnY + 58, Math.min(VW * 0.5, 190));
+
+    const pawY = VH - 58;
+    drawPaw("paw_l", 52, pawY, 72, 1);
+    drawPaw("paw_r", VW - 52, pawY, 72, 1);
+  }
+
+  function drawSprite(key, x, y, w) {
+    const im = img[key];
+    if (!im) return;
+    const h = w * (im.height / im.width);
+    ctx.drawImage(im, x - w / 2, y, w, h);
+  }
+
+  function drawTimer(x, y) {
+    const label = fmtTime(state.time);
+    ctx.font = 'bold 26px "Arial Rounded MT Bold", "Trebuchet MS", sans-serif';
+    const w = 124;
+    const h = 42;
+    ctx.fillStyle = "#3b241c";
+    ctx.beginPath();
+    ctx.roundRect(x - w / 2, y, w, h, 21);
+    ctx.fill();
+    ctx.fillStyle = "#ffd0e6";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(label, x, y + h / 2 + 1);
+    ctx.textBaseline = "alphabetic";
+  }
+
+  function drawUI() {
+    const top = 18;
 
     if (state.phase === "title") {
-      ctx.font = "16px system-ui,sans-serif";
-      ctx.fillStyle = "#4a7064";
-      ctx.fillText("闭环赛道 · 左右漂移冲线", VW / 2, VH * 0.42);
-      ctx.font = "bold 18px system-ui,sans-serif";
-      ctx.fillStyle = "#ff6eb4";
-      ctx.fillText("点屏幕开始", VW / 2, VH * 0.48);
-      ctx.font = "13px system-ui,sans-serif";
-      ctx.fillStyle = "#5b8a7a";
-      ctx.fillText("按住左右猫爪转向 · 别冲出跑道", VW / 2, VH * 0.54);
+      const logoW = Math.min(VW * 0.78, 320);
+      drawSprite("ui_meow", VW / 2, top, logoW);
+      drawSprite("ui_drift", VW / 2, top + logoW * 0.62, Math.min(VW * 0.72, 300));
+      drawSprite("ui_tap", VW / 2, VH * 0.4, Math.min(VW * 0.86, 340));
+      drawSprite("ui_hints", VW / 2, VH * 0.47, Math.min(VW * 0.9, 360));
+    } else {
+      drawTimer(VW / 2, top);
     }
 
-    if ((state.phase === "crash" || state.phase === "done") && state.message) {
-      ctx.font = "bold 22px system-ui,sans-serif";
-      ctx.fillStyle = state.phase === "done" ? "#e8a317" : "#ff6eb4";
-      ctx.strokeStyle = "#fff";
-      ctx.lineWidth = 6;
-      ctx.strokeText(state.message, VW / 2, VH * 0.4);
-      ctx.fillText(state.message, VW / 2, VH * 0.4);
-      if (state.phase === "done") {
-        ctx.font = "18px system-ui,sans-serif";
-        ctx.fillStyle = "#2d3436";
-        ctx.fillText(fmtTime(state.time), VW / 2, VH * 0.4 + 36);
-        if (img.trophy) ctx.drawImage(img.trophy, VW / 2 - 36, VH * 0.4 + 50, 72, 66);
-      }
-      ctx.font = "14px system-ui,sans-serif";
-      ctx.fillStyle = "#5b8a7a";
-      ctx.fillText("点屏幕再来一局", VW / 2, VH * 0.72);
+    if (state.phase === "countdown") {
+      const n = Math.ceil(state.countdown);
+      const key = n >= 3 ? "ui_ready" : n === 2 ? "ui_set" : "ui_go";
+      drawSprite(key, VW / 2, VH * 0.34, Math.min(VW * 0.72, 280));
+    }
+
+    if (state.phase === "done") {
+      drawSprite("ui_win", VW / 2, VH * 0.28, Math.min(VW * 0.7, 260));
+      drawSprite("ui_again", VW / 2, VH * 0.58, Math.min(VW * 0.62, 240));
     }
 
     // paw buttons
@@ -521,12 +957,6 @@
           })
       )
     ).then(() => {
-      if (img.track) {
-        sampleCanvas.width = WORLD_W;
-        sampleCanvas.height = WORLD_H;
-        sampleCtx.drawImage(img.track, 0, 0, WORLD_W, WORLD_H);
-        sampleReady = true;
-      }
       if (PATH.length) resetCar();
       ready = true;
     });
@@ -549,6 +979,7 @@
     },
     startRace,
     resize,
+    props,
   };
 
   resize();

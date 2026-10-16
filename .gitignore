@@ -6,3 +6,5 @@ assets/game/debug_path.jpg
 *.log
 .DS_Store
 Thumbs.db
+.vercel
+.env*.local
